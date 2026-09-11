@@ -65,3 +65,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
+
+replace cloud.google.com/go/bigtable => /usr/local/google/home/derekyau/dev/google-cloud-go-bigtable
