@@ -1,4 +1,4 @@
-// Copyright 2024 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -158,7 +158,7 @@ func splitBatchIntoChunks(data []byte, chunkSize int) [][]byte {
 
 // chunkedTypedResponses builds a series of TypedReadRowsResponse messages by fragmenting data into chunks
 // and adding a flush with CRC32C and resume token to the final response.
-func chunkedTypedResponses(data []byte, chunkSize int, resumeToken []byte, includeChecksum bool, prevBatches ...[]byte) []*btpb.TypedReadRowsResponse {
+func chunkedTypedResponses(data []byte, chunkSize int, resumeToken []byte, prevBatches ...[]byte) []*btpb.TypedReadRowsResponse {
 	chunks := splitBatchIntoChunks(data, chunkSize)
 	var responses []*btpb.TypedReadRowsResponse
 
@@ -177,7 +177,7 @@ func chunkedTypedResponses(data []byte, chunkSize int, resumeToken []byte, inclu
 
 		if isLast {
 			var flushChecksum *uint32
-			if includeChecksum && len(data) > 0 {
+			if len(data) > 0 {
 				allBatches := make([][]byte, 0, len(prevBatches)+1)
 				allBatches = append(allBatches, prevBatches...)
 				allBatches = append(allBatches, data)

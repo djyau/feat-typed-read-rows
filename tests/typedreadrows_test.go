@@ -1,4 +1,4 @@
-// Copyright 2024 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -85,7 +85,7 @@ func TestTypedReadRows_ArbitraryChunkFragmentation(t *testing.T) {
 
 	for _, chunkSize := range []int{1, 2, 3, 7, 15, 23} {
 		t.Run(fmt.Sprintf("ChunkSize_%d", chunkSize), func(t *testing.T) {
-			responses := chunkedTypedResponses(data, chunkSize, []byte("token-frag"), true)
+			responses := chunkedTypedResponses(data, chunkSize, []byte("token-frag"))
 
 			server := initMockServer(t)
 			server.TypedReadRowsFn = mockTypedReadRowsFn(nil, responsesToActions(responses...)...)
@@ -124,9 +124,9 @@ func TestTypedReadRows_Checksum_Corrupt_Fails(t *testing.T) {
 // the stale data, yielding row1 alone.
 func TestTypedReadRows_Reset_WithDataInSameResponse(t *testing.T) {
 	row1 := dummyTypedRow("row1", "committed-1")
-	row3 := dummyTypedRow("row3", "committed-3")
+	row2 := dummyTypedRow("row2", "committed-2")
 
-	resetWithData := dummyFlushResponse("row3", "committed-3", "token-row3", row1)
+	resetWithData := dummyFlushResponse("row2", "committed-2", "token-row2", row1)
 	resetWithData.Response.Reset_ = true
 
 	server := initMockServer(t)
@@ -139,7 +139,7 @@ func TestTypedReadRows_Reset_WithDataInSameResponse(t *testing.T) {
 	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "test-table"), nil)
 
 	checkResultOkStatus(t, res)
-	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row3}, res.Rows)
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
 }
 
 // TestTypedReadRows_TargetRouting verifies table_name, authorized_view_name, and
@@ -580,7 +580,7 @@ func TestTypedReadRows_Resumption_DisconnectMidChunk(t *testing.T) {
 
 	data1 := serializeTypedRows(row1)
 	data2 := serializeTypedRows(row2)
-	chunks := chunkedTypedResponses(data2, len(data2)/3, []byte("token2"), true, data1)
+	chunks := chunkedTypedResponses(data2, len(data2)/3, []byte("token2"), data1)
 
 	actions := []*typedReadRowsAction{dummyTypedAction("row-committed", "v1", "token1")}
 	actions = append(actions, responsesToActions(chunks[:2]...)...)
@@ -690,19 +690,19 @@ func TestTypedReadRows_Resumption_RetryExhaustion(t *testing.T) {
 // correctly even after the client has resumed from a prior disconnect.
 func TestTypedReadRows_Resumption_WithResetInNewStream(t *testing.T) {
 	// 0. Common variables
-	row1 := dummyTypedRow("row-before-disconnect", "v1")
-	row2 := dummyTypedRow("row-valid-after-reset", "v2")
+	row1 := dummyTypedRow("row1", "committed-1")
+	row2 := dummyTypedRow("row2", "committed-2")
 
 	recorder := make(chan *typedReadRowsReqRecord, 2)
 
 	// 1. Instantiate the mock server
 	server := initMockServer(t)
 	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
-		dummyTypedAction("row-before-disconnect", "v1", "token-r1"),
+		dummyTypedAction("row1", "committed-1", "token-r1"),
 		&typedReadRowsAction{rpcError: codes.Unavailable},
-		dummyUncommittedAction("row-dirty-after-reconnect", "dirty"),
+		dummyUncommittedAction("row2", "uncommitted-2"),
 		typedResetAction(),
-		dummyTypedAction("row-valid-after-reset", "v2", "token-r2", row1),
+		dummyTypedAction("row2", "committed-2", "token-r2", row1),
 	)
 
 	// 2. Build the request to test proxy
@@ -1048,7 +1048,7 @@ func TestTypedReadRows_MultiFamily_MultiColumn_MultiCell_Ordering(t *testing.T) 
 // and that a second back-to-back reset arriving with an already-empty buffer is a harmless no-op.
 func TestTypedReadRows_ConsecutiveResets(t *testing.T) {
 	row1 := dummyTypedRow("row1", "committed-1")
-	row3 := dummyTypedRow("row3", "committed-3")
+	row2 := dummyTypedRow("row2", "committed-2")
 
 	server := initMockServer(t)
 	server.TypedReadRowsFn = mockTypedReadRowsFn(nil,
@@ -1056,14 +1056,14 @@ func TestTypedReadRows_ConsecutiveResets(t *testing.T) {
 		dummyUncommittedAction("row2", "uncommitted-2"),
 		typedResetAction(),
 		typedResetAction(),
-		dummyTypedAction("row3", "committed-3", "token-row3", row1),
+		dummyTypedAction("row2", "committed-2", "token-row2", row1),
 	)
 
 	req := makeProxyTypedReadRowsRequest(t, "consecutive-resets-table")
 	res := doTypedReadRowsOp(t, server, req, nil)
 
 	checkResultOkStatus(t, res)
-	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row3}, res.Rows)
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
 }
 
 // TestTypedReadRows_Resumption_ReverseScan verifies resumption behavior when reading in reverse order.
