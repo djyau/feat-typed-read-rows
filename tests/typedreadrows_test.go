@@ -244,12 +244,12 @@ func TestTypedReadRows_ServerErrorPropagated(t *testing.T) {
 	}
 }
 
-// TestTypedReadRows_MissingTarget_InvalidArgument verifies that a request with no target returns INVALID_ARGUMENT.
+// TestTypedReadRows_MissingTarget_InvalidArgument verifies that a request with no target returns
+// INVALID_ARGUMENT without sending an RPC to the server.
 func TestTypedReadRows_MissingTarget_InvalidArgument(t *testing.T) {
+	recorder := make(chan *typedReadRowsReqRecord, 1)
 	server := initMockServer(t)
-	server.TypedReadRowsFn = func(req *btpb.TypedReadRowsRequest, srv btpb.Bigtable_TypedReadRowsServer) error {
-		return nil
-	}
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder)
 
 	req := &testproxypb.TypedReadRowsRequest{
 		ClientId: t.Name(),
@@ -260,6 +260,7 @@ func TestTypedReadRows_MissingTarget_InvalidArgument(t *testing.T) {
 
 	assert.NotNil(t, res)
 	assert.Equal(t, int32(codes.InvalidArgument), res.GetStatus().GetCode())
+	assert.Empty(t, recorder, "server must not be called when target is missing")
 }
 
 // TestTypedReadRows_EmptyTable_Success verifies that an empty stream returns 0 rows and OK status.
@@ -354,12 +355,14 @@ func TestTypedReadRows_InvalidProtobuf_Fails(t *testing.T) {
 		},
 	}
 
+	recorder := make(chan *typedReadRowsReqRecord, 2)
 	server := initMockServer(t)
-	server.TypedReadRowsFn = mockTypedReadRowsFn(nil, &typedReadRowsAction{response: resp})
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{response: resp})
 
 	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "test-table"), nil)
 
 	assertTypedReadRowsFailure(t, res, "expected failure on unparseable batch data")
+	assertResumeTokens(t, recorder, "")
 }
 
 // TestTypedReadRows_Generic_Headers tests that TypedReadRows request sends client and resource info,
@@ -606,16 +609,17 @@ func TestTypedReadRows_Resumption_DisconnectMidChunk(t *testing.T) {
 }
 
 // TestTypedReadRows_Resumption_MultipleSequentialDisconnects verifies that multiple cascading
-// stream disconnections (covering both UNAVAILABLE and ABORTED retryable status codes) at
-// sequential checkpoints each advance the resume_token properly and accumulate the full set of
-// rows without loss or duplication.
+// stream disconnections (covering both UNAVAILABLE and ABORTED retryable status codes, including
+// an intermediate retry attempt that fails immediately before emitting any data or token) preserve
+// the latest resume_token and running checksum across attempts and accumulate the full set of rows
+// without loss or duplication.
 func TestTypedReadRows_Resumption_MultipleSequentialDisconnects(t *testing.T) {
 	// 0. Common variables
 	row1 := dummyTypedRow("row-seq-1", "v1")
 	row2 := dummyTypedRow("row-seq-2", "v2")
 	row3 := dummyTypedRow("row-seq-3", "v3")
 
-	recorder := make(chan *typedReadRowsReqRecord, 3)
+	recorder := make(chan *typedReadRowsReqRecord, 4)
 
 	// 1. Instantiate the mock server
 	server := initMockServer(t)
@@ -624,6 +628,7 @@ func TestTypedReadRows_Resumption_MultipleSequentialDisconnects(t *testing.T) {
 		&typedReadRowsAction{rpcError: codes.Unavailable},
 		dummyTypedAction("row-seq-2", "v2", "token-seq-2", row1),
 		&typedReadRowsAction{rpcError: codes.Aborted},
+		&typedReadRowsAction{rpcError: codes.Unavailable}, // Immediate failure before any response on attempt 3
 		dummyTypedAction("row-seq-3", "v3", "token-seq-3", row1, row2),
 	)
 
@@ -635,7 +640,7 @@ func TestTypedReadRows_Resumption_MultipleSequentialDisconnects(t *testing.T) {
 
 	// 4. Check the response
 	checkResultOkStatus(t, res)
-	assertResumeTokens(t, recorder, "", "token-seq-1", "token-seq-2")
+	assertResumeTokens(t, recorder, "", "token-seq-1", "token-seq-2", "token-seq-2")
 	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2, row3}, res.Rows)
 }
 
@@ -879,13 +884,15 @@ func TestTypedReadRows_Resumption_EmptyTableWithToken(t *testing.T) {
 // TestTypedReadRows_MissingInitialTableSchema_Fails verifies that when the server omits TableSchema
 // on the very first message carrying data, the client fails fast rather than processing data.
 func TestTypedReadRows_MissingInitialTableSchema_Fails(t *testing.T) {
+	recorder := make(chan *typedReadRowsReqRecord, 2)
 	server := initMockServer(t)
 	server.DisableTypedReadRowsAutoSchema = true
-	server.TypedReadRowsFn = mockTypedReadRowsFn(nil, dummyTypedAction("row-no-schema", "v", "token-no-schema"))
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, dummyTypedAction("row-no-schema", "v", "token-no-schema"))
 
 	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "missing-schema-table"), nil)
 
 	assertTypedReadRowsFailure(t, res, "expected failure when the initial TableSchema is missing")
+	assertResumeTokens(t, recorder, "")
 }
 
 // TestTypedReadRows_Resumption_MissingTableSchemaOnRetry_Fails verifies that every reconnected
@@ -947,15 +954,40 @@ func TestTypedReadRows_SchemaRowKeyKindMismatch_Fails(t *testing.T) {
 			resp := makeFlushResponse("token-mismatch", []*btpb.TypedRow{tc.row})
 			resp.TableSchema = tc.schema
 
+			recorder := make(chan *typedReadRowsReqRecord, 2)
 			server := initMockServer(t)
-			server.TypedReadRowsFn = mockTypedReadRowsFn(nil, &typedReadRowsAction{response: resp})
+			server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{response: resp})
 
 			req := makeProxyTypedReadRowsRequest(t, "schema-mismatch-table")
 			res := doTypedReadRowsOp(t, server, req, nil)
 
 			assertTypedReadRowsFailure(t, res, "expected failure for "+tc.name)
+			assertResumeTokens(t, recorder, "")
 		})
 	}
+}
+
+// TestTypedReadRows_InvalidRowKeySchemaType_Fails verifies that when TableSchema.row_key_schema
+// contains a field with an unset/invalid Type (KIND_NOT_SET), the client rejects the schema and
+// fails the read without retrying.
+func TestTypedReadRows_InvalidRowKeySchemaType_Fails(t *testing.T) {
+	invalidSchema := makeStructRowKeySchema(&btpb.Type{})
+	row := makeStructuredTypedRow(
+		[]*btpb.Value{strVal("part1-val")},
+		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v")))),
+	)
+	resp := makeFlushResponse("token-invalid-type", []*btpb.TypedRow{row})
+	resp.TableSchema = invalidSchema
+
+	recorder := make(chan *typedReadRowsReqRecord, 2)
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{response: resp})
+
+	req := makeProxyTypedReadRowsRequest(t, "invalid-schema-type-table")
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	assertTypedReadRowsFailure(t, res, "expected failure when row_key_schema has an invalid/unset field type")
+	assertResumeTokens(t, recorder, "")
 }
 
 // TestTypedReadRows_Cell_EmptyValueAndLabels covers the two cell-payload edge cases that a server
@@ -1149,6 +1181,7 @@ func TestTypedReadRows_Resumption_RowsLimitFulfilledBeforeDisconnect(t *testing.
 	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
 		typedFlushAction("token-r2", []*btpb.TypedRow{row1, row2}),
 		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedHeartbeatAction("token-r2-done"),
 	)
 
 	// 2. Build the request to test proxy
@@ -1163,6 +1196,31 @@ func TestTypedReadRows_Resumption_RowsLimitFulfilledBeforeDisconnect(t *testing.
 	reqs := assertResumeTokens(t, recorder, "", "token-r2")
 	assert.Equal(t, int64(2), reqs[0].GetRowsLimit())
 	assert.Equal(t, int64(2), reqs[1].GetRowsLimit())
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_ErrorAfterFinalData verifies that when an unbounded scan flushes all
+// rows and then disconnects with a retryable error before the server closes the stream with OK, the
+// client resumes from the latest resume_token and completes cleanly without duplicating rows when
+// the resumed stream finishes with a trailing heartbeat.
+func TestTypedReadRows_Resumption_ErrorAfterFinalData(t *testing.T) {
+	row1 := dummyTypedRow("row1", "v1")
+	row2 := dummyTypedRow("row2", "v2")
+
+	recorder := make(chan *typedReadRowsReqRecord, 2)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedFlushAction("token-final", []*btpb.TypedRow{row1, row2}),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedHeartbeatAction("token-final-done"),
+	)
+
+	req := makeProxyTypedReadRowsRequest(t, "error-after-final-data-table")
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token-final")
 	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
 }
 
@@ -1269,12 +1327,14 @@ func TestTypedReadRows_MissingResumeToken_Fails(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			recorder := make(chan *typedReadRowsReqRecord, 2)
 			server := initMockServer(t)
-			server.TypedReadRowsFn = mockTypedReadRowsFn(nil, &typedReadRowsAction{response: tc.resp})
+			server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{response: tc.resp})
 
 			res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "missing-token-table"), nil)
 
 			assertTypedReadRowsFailure(t, res, "expected failure when flush has no resume token ("+tc.name+")")
+			assertResumeTokens(t, recorder, "")
 		})
 	}
 }
@@ -1284,8 +1344,9 @@ func TestTypedReadRows_NonEmptyBatchWithoutChecksum_Fails(t *testing.T) {
 	row := dummyTypedRow("row1", "v")
 	data := serializeTypedRows(row)
 
+	recorder := make(chan *typedReadRowsReqRecord, 2)
 	server := initMockServer(t)
-	server.TypedReadRowsFn = mockTypedReadRowsFn(nil, &typedReadRowsAction{
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{
 		response: &btpb.TypedReadRowsResponse{
 			Response: &btpb.PartialRowResponse{
 				PartialRows: &btpb.PartialRowResponse_TypedRowsBatch{
@@ -1302,6 +1363,7 @@ func TestTypedReadRows_NonEmptyBatchWithoutChecksum_Fails(t *testing.T) {
 	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "no-checksum-table"), nil)
 
 	assertTypedReadRowsFailure(t, res, "expected failure when non-empty batch lacks checksum")
+	assertResumeTokens(t, recorder, "")
 }
 
 // TestTypedReadRows_MidStream_SchemaEvolution verifies that the client re-reads TableSchema on
@@ -1350,8 +1412,9 @@ func TestTypedReadRows_MidStream_SchemaEvolution(t *testing.T) {
 
 // TestTypedReadRows_StructuredRowKeys_Resumption verifies reading and resuming across a stream
 // disconnect with multi-field structured row keys covering all 8 supported structured row key data
-// types (String, Bytes, Int64, Float64, Float32, Bool, Timestamp, Date) as well as null
-// (KIND_NOT_SET) elements.
+// types (String, Bytes, Int64, Float64, Float32, Bool, Timestamp, Date), null (KIND_NOT_SET)
+// elements across every type, and subsequent responses in the same stream omitting TableSchema
+// (since the server only populates table_schema on the first response of each stream).
 func TestTypedReadRows_StructuredRowKeys_Resumption(t *testing.T) {
 	schema := makeStructRowKeySchema(
 		strType(),
@@ -1393,11 +1456,29 @@ func TestTypedReadRows_StructuredRowKeys_Resumption(t *testing.T) {
 		},
 		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v2")))),
 	)
+	// row3 exercises NULL (KIND_NOT_SET) across all 8 supported structured row key scalar types.
+	row3 := makeStructuredTypedRow(
+		[]*btpb.Value{
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+		},
+		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v3")))),
+	)
 
 	resp1 := makeFlushResponse("token-srk-1", []*btpb.TypedRow{row1})
 	resp1.TableSchema = schema
 	resp2 := makeFlushResponse("token-srk-2", []*btpb.TypedRow{row2}, row1)
 	resp2.TableSchema = schema
+	// Subsequent response on the same stream omits TableSchema to verify the client retains
+	// the stream's initial TableSchema across batches within a stream.
+	resp3 := makeFlushResponse("token-srk-3", []*btpb.TypedRow{row3}, row1, row2)
 
 	recorder := make(chan *typedReadRowsReqRecord, 2)
 
@@ -1406,6 +1487,7 @@ func TestTypedReadRows_StructuredRowKeys_Resumption(t *testing.T) {
 		&typedReadRowsAction{response: resp1},
 		&typedReadRowsAction{rpcError: codes.Unavailable},
 		&typedReadRowsAction{response: resp2},
+		&typedReadRowsAction{response: resp3},
 	)
 
 	req := makeProxyTypedReadRowsRequest(t, "structured-row-keys-resumption-table")
@@ -1415,7 +1497,7 @@ func TestTypedReadRows_StructuredRowKeys_Resumption(t *testing.T) {
 
 	checkResultOkStatus(t, res)
 	assertResumeTokens(t, recorder, "", "token-srk-1")
-	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2, row3}, res.Rows)
 }
 
 // TestTypedReadRows_Resumption_MultipleSequentialHeartbeats verifies that intermediate sparse-query
