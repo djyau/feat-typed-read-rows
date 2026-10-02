@@ -990,23 +990,30 @@ func TestTypedReadRows_InvalidRowKeySchemaType_Fails(t *testing.T) {
 	assertResumeTokens(t, recorder, "")
 }
 
-// TestTypedReadRows_Cell_EmptyValueAndLabels covers the two cell-payload edge cases that a server
-// can actually produce: a cell whose raw_value is present but zero-length, and a cell carrying an
-// explicit timestamp plus labels.
+// TestTypedReadRows_Cell_EmptyByteQualifierEmptyValueAndLabels covers the column/cell payload edge
+// cases that a server can actually produce: a column whose raw_value byte qualifier is present but
+// zero-length ([]byte{}), a cell whose raw_value is present but zero-length ([]byte{}), and a cell
+// carrying an explicit timestamp plus labels.
 //
 // Note on scope: on the server side a TypedCell's value is always raw_value, and a TypedColumn's
-// qualifier is always raw_value -- no other Value kind is reachable, and a cell always carries a
-// value rather than leaving the field unset. So there is deliberately no coverage here of
-// string_value/int_value/etc. cells or of a nil cell value; such a stream cannot occur, and
-// asserting on it would invite client authors to implement handling for cases that never arrive.
-// Structured array_value only ever appears in row keys (see MidStream_SchemaEvolution and
-// StructuredRowKeys_Resumption) and in TypedRowSet.row_prefixes on the request side.
-func TestTypedReadRows_Cell_EmptyValueAndLabels(t *testing.T) {
+// qualifier is always raw_value -- no other Value kind is reachable, and a column/cell always
+// carries a raw_value rather than leaving the Value field unset. So there is deliberately no
+// coverage here of string_value/int_value/etc. qualifiers or cells, or of a nil Value; such a
+// stream cannot occur, and asserting on it would invite client authors to implement handling for
+// cases that never arrive. Structured array_value only ever appears in row keys (see
+// MidStream_SchemaEvolution and StructuredRowKeys_Resumption) and in TypedRowSet.row_prefixes on
+// the request side.
+func TestTypedReadRows_Cell_EmptyByteQualifierEmptyValueAndLabels(t *testing.T) {
 	// 0. Common variables
 	row := makeTypedRow([]byte("row-cell-edge-cases"),
 		makeTypedFamily("cf",
-			// An empty-but-present cell value is a genuine Bigtable state and must survive intact
-			// rather than being normalised away to a nil Value.
+			// makeTypedColumn([]byte{}, ...) constructs a present raw_value qualifier with empty
+			// bytes (Value{Kind: &Value_RawValue{RawValue: []byte{}}}), NOT a nil/unset Value.
+			// Empty byte column qualifiers are a standard Bigtable pattern and must not be
+			// misclassified as null.
+			makeTypedColumn([]byte{}, makeTypedCell([]byte("empty-byte-qualifier-val"))),
+			// An empty-but-present cell raw_value is a genuine Bigtable state and must survive
+			// intact rather than being normalised away to a nil Value.
 			makeTypedColumn([]byte("empty_value_col"), makeTypedCell([]byte{})),
 			makeTypedColumn([]byte("labelled_col"),
 				makeTypedCellWithTimestampAndLabels([]byte("payload-with-labels"), 1609459200000000, "label1", "label2"),
@@ -1412,9 +1419,10 @@ func TestTypedReadRows_MidStream_SchemaEvolution(t *testing.T) {
 
 // TestTypedReadRows_StructuredRowKeys_Resumption verifies reading and resuming across a stream
 // disconnect with multi-field structured row keys covering all 8 supported structured row key data
-// types (String, Bytes, Int64, Float64, Float32, Bool, Timestamp, Date), null (KIND_NOT_SET)
-// elements across every type, and subsequent responses in the same stream omitting TableSchema
-// (since the server only populates table_schema on the first response of each stream).
+// types (String, Bytes, Int64, Float64, Float32, Bool, Timestamp, Date), zero-valued non-null
+// scalars, null (KIND_NOT_SET) elements across every type, and subsequent responses in the same
+// stream omitting TableSchema (since the server only populates table_schema on the first response
+// of each stream).
 func TestTypedReadRows_StructuredRowKeys_Resumption(t *testing.T) {
 	schema := makeStructRowKeySchema(
 		strType(),
@@ -1442,16 +1450,18 @@ func TestTypedReadRows_StructuredRowKeys_Resumption(t *testing.T) {
 		},
 		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v1")))),
 	)
+	// row2 exercises zero/empty non-null scalar values (whose oneof discriminator is set,
+	// distinct from KIND_NOT_SET in row3).
 	row2 := makeStructuredTypedRow(
 		[]*btpb.Value{
-			strVal("tenant-b"),
-			bytesVal([]byte{0x03, 0x04}),
-			intVal(200),
-			floatVal(-2.718281828459045),
-			floatVal(-0.25),
+			strVal(""),
+			bytesVal([]byte{}),
+			intVal(0),
+			floatVal(0.0),
+			floatVal(0.0),
 			boolVal(false),
-			timestampVal(1700086400, 0),
-			dateVal(2026, 3, 26),
+			timestampVal(0, 0),
+			dateVal(1970, 1, 1),
 			strVal("non-null-tag"),
 		},
 		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v2")))),

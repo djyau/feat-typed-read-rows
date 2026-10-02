@@ -101,7 +101,7 @@ func makeTypedCellWithTimestampAndLabels(val []byte, timestampMicros int64, labe
 	}
 }
 
-// makeTypedColumn creates a TypedColumn with qualifier and cells.
+// makeTypedColumn creates a TypedColumn with a raw_value bytes qualifier and cells.
 func makeTypedColumn(qualifier []byte, cells ...*btpb.TypedCell) *btpb.TypedColumn {
 	return &btpb.TypedColumn{
 		Qualifier: rawVal(qualifier),
