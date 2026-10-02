@@ -18,13 +18,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"log"
 	"testing"
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"github.com/google/go-cmp/cmp"
+	"github.com/googleapis/cloud-bigtable-clients-test/testproxypb"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
@@ -32,45 +33,36 @@ import (
 
 var trrCrc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
-// trrMetaChecksum returns the meta-checksum for a single batch, matching Bigtable
-// TypedRowMerger's algorithm: it computes CRC32C of the batch bytes, then feeds that
-// uint32 into a CRC32C hasher. Note this is NOT the same value as trrBatchCrc(data),
-// which is only the first of those two stages. Equivalent to trrMetaChecksumMulti(data).
+// trrChainedChecksum computes the next running checksum in the chain by computing
+// CRC32C of the batch bytes followed by the 4-byte little-endian running checksum.
+// Matches Bigtable TypedRowMerger: H_k = CRC32C(batch_bytes_k || LE32(H_{k-1})).
+func trrChainedChecksum(running uint32, batch []byte) uint32 {
+	h := crc32.New(trrCrc32cTable)
+	h.Write(batch)
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], running)
+	h.Write(buf[:])
+	return h.Sum32()
+}
+
+// trrMetaChecksum returns the stream checksum for a single initial batch starting from 0.
+// Matches Bigtable TypedRowMerger: H_1 = CRC32C(batch_bytes_1 || LE32(0)).
+// Equivalent to trrMetaChecksumMulti(data).
 func trrMetaChecksum(data []byte) uint32 {
-	batchCrc := crc32.Checksum(data, trrCrc32cTable)
-	h := crc32.New(trrCrc32cTable)
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, batchCrc)
-	h.Write(buf)
-	return h.Sum32()
+	return trrChainedChecksum(0, data)
 }
 
-// trrMetaChecksumMulti computes the cumulative meta-checksum across multiple batches.
+// trrMetaChecksumMulti computes the cumulative running checksum across a sequence of
+// batches, starting from 0. Empty batches are skipped to mirror TypedRowMerger's rule
+// that empty batches do not advance the running checksum.
 func trrMetaChecksumMulti(batches ...[]byte) uint32 {
-	h := crc32.New(trrCrc32cTable)
-	buf := make([]byte, 4)
+	var running uint32 = 0
 	for _, batch := range batches {
-		batchCrc := crc32.Checksum(batch, trrCrc32cTable)
-		binary.LittleEndian.PutUint32(buf, batchCrc)
-		h.Write(buf)
+		if len(batch) > 0 {
+			running = trrChainedChecksum(running, batch)
+		}
 	}
-	return h.Sum32()
-}
-
-// trrBatchCrc computes CRC32C of data using Castagnoli table.
-func trrBatchCrc(data []byte) uint32 {
-	return crc32.Checksum(data, trrCrc32cTable)
-}
-
-// trrMetaChecksumFromCrcs computes the cumulative meta-checksum from individual batch CRC32C values.
-func trrMetaChecksumFromCrcs(crcs ...uint32) uint32 {
-	h := crc32.New(trrCrc32cTable)
-	buf := make([]byte, 4)
-	for _, c := range crcs {
-		binary.LittleEndian.PutUint32(buf, c)
-		h.Write(buf)
-	}
-	return h.Sum32()
+	return running
 }
 
 // A note on Value kinds, since TypedCell/TypedColumn/TypedRow all carry the general-purpose
@@ -92,50 +84,28 @@ func trrMetaChecksumFromCrcs(crcs ...uint32) uint32 {
 
 // makeTypedCell creates a TypedCell with bytes value.
 func makeTypedCell(val []byte) *btpb.TypedCell {
-	return &btpb.TypedCell{
-		Timestamp: timestamppb.New(time.UnixMicro(0)),
-		Value: &btpb.Value{
-			Kind: &btpb.Value_RawValue{
-				RawValue: val,
-			},
-		},
-	}
+	return makeTypedCellWithTimestamp(val, 0)
 }
 
 // makeTypedCellWithTimestamp creates a TypedCell with a timestamp and bytes value.
 func makeTypedCellWithTimestamp(val []byte, timestampMicros int64) *btpb.TypedCell {
-	return &btpb.TypedCell{
-		Timestamp: timestamppb.New(time.UnixMicro(timestampMicros)),
-		Value: &btpb.Value{
-			Kind: &btpb.Value_RawValue{
-				RawValue: val,
-			},
-		},
-	}
+	return makeTypedCellWithTimestampAndLabels(val, timestampMicros)
 }
 
 // makeTypedCellWithTimestampAndLabels creates a TypedCell with a timestamp, bytes value, and labels.
 func makeTypedCellWithTimestampAndLabels(val []byte, timestampMicros int64, labels ...string) *btpb.TypedCell {
 	return &btpb.TypedCell{
 		Timestamp: timestamppb.New(time.UnixMicro(timestampMicros)),
-		Value: &btpb.Value{
-			Kind: &btpb.Value_RawValue{
-				RawValue: val,
-			},
-		},
-		Labels: labels,
+		Value:     rawVal(val),
+		Labels:    labels,
 	}
 }
 
 // makeTypedColumn creates a TypedColumn with qualifier and cells.
 func makeTypedColumn(qualifier []byte, cells ...*btpb.TypedCell) *btpb.TypedColumn {
 	return &btpb.TypedColumn{
-		Qualifier: &btpb.Value{
-			Kind: &btpb.Value_RawValue{
-				RawValue: qualifier,
-			},
-		},
-		Cells: cells,
+		Qualifier: rawVal(qualifier),
+		Cells:     cells,
 	}
 }
 
@@ -150,11 +120,7 @@ func makeTypedFamily(familyName string, cols ...*btpb.TypedColumn) *btpb.TypedFa
 // makeTypedRow creates a TypedRow with row key and families.
 func makeTypedRow(rowKey []byte, families ...*btpb.TypedFamily) *btpb.TypedRow {
 	return &btpb.TypedRow{
-		RowKey: &btpb.Value{
-			Kind: &btpb.Value_RawValue{
-				RawValue: rowKey,
-			},
-		},
+		RowKey:   rawVal(rowKey),
 		Families: families,
 	}
 }
@@ -169,7 +135,7 @@ func serializeTypedRows(rows ...*btpb.TypedRow) []byte {
 	}
 	data, err := proto.Marshal(typedRows)
 	if err != nil {
-		log.Fatalln("Failed to encode TypedRows:", err)
+		panic(fmt.Sprintf("Failed to encode TypedRows: %v", err))
 	}
 	return data
 }
@@ -211,8 +177,10 @@ func chunkedTypedResponses(data []byte, chunkSize int, resumeToken []byte, inclu
 
 		if isLast {
 			var flushChecksum *uint32
-			if includeChecksum {
-				allBatches := append(append([][]byte{}, prevBatches...), data)
+			if includeChecksum && len(data) > 0 {
+				allBatches := make([][]byte, 0, len(prevBatches)+1)
+				allBatches = append(allBatches, prevBatches...)
+				allBatches = append(allBatches, data)
 				c := trrMetaChecksumMulti(allBatches...)
 				flushChecksum = &c
 			}
@@ -282,8 +250,7 @@ func serializeBatchArg(arg any) []byte {
 	case []*btpb.TypedRow:
 		return serializeTypedRows(v...)
 	default:
-		log.Fatalf("Unsupported prevBatches element type %T", arg)
-		return nil
+		panic(fmt.Sprintf("Unsupported prevBatches element type %T", arg))
 	}
 }
 
@@ -292,9 +259,9 @@ func serializeBatchArg(arg any) []byte {
 // prevBatches elements can be *btpb.TypedRow, []*btpb.TypedRow, or raw []byte.
 //
 // IMPORTANT: each prevBatches element is one previously *flush-committed* batch, not one
-// previously-sent response. A batch may be chunked across several responses; the wrapper in
-// mockserver.go accumulates those chunks and folds exactly one CRC per flush. The cumulative
-// checksum does the same, so the grouping of these arguments changes the result:
+// previously-sent response. A batch may be chunked across several responses; the client accumulates
+// those chunks and folds exactly one CRC per flush. The cumulative checksum does the same, so the
+// grouping of these arguments changes the result:
 //
 //	makeFlushResponse(tok, rows, row1, row2)                   // two prior batches of one row each
 //	makeFlushResponse(tok, rows, []*btpb.TypedRow{row1, row2})  // one prior batch of two rows
@@ -305,18 +272,20 @@ func makeFlushResponse(resumeToken string, rows []*btpb.TypedRow, prevBatches ..
 	data := serializeTypedRows(rows...)
 	var allBatches [][]byte
 	for _, pb := range prevBatches {
-		// Skip empty batches to match the wrapper's accumulation rule in mockserver.go, which
-		// only folds a CRC for a flush that has unflushed data behind it.
 		if b := serializeBatchArg(pb); len(b) > 0 {
 			allBatches = append(allBatches, b)
 		}
 	}
 	allBatches = append(allBatches, data)
-	crc := trrMetaChecksumMulti(allBatches...)
 	var flush *btpb.PartialRowResponse_Flush
 	if resumeToken != "" {
+		var flushChecksum *uint32
+		if len(data) > 0 {
+			crc := trrMetaChecksumMulti(allBatches...)
+			flushChecksum = &crc
+		}
 		flush = &btpb.PartialRowResponse_Flush{
-			Checksum:    &crc,
+			Checksum:    flushChecksum,
 			ResumeToken: []byte(resumeToken),
 		}
 	}
@@ -330,6 +299,15 @@ func makeFlushResponse(resumeToken string, rows []*btpb.TypedRow, prevBatches ..
 			Flush: flush,
 		},
 	}
+}
+
+// makeCorruptFlushResponse is like makeFlushResponse, except that the Flush checksum bits are flipped
+// to simulate an in-transit corruption / checksum mismatch.
+func makeCorruptFlushResponse(resumeToken string, rows []*btpb.TypedRow, prevBatches ...any) *btpb.TypedReadRowsResponse {
+	resp := makeFlushResponse(resumeToken, rows, prevBatches...)
+	corruptCRC := resp.GetResponse().GetFlush().GetChecksum() ^ 0xFFFFFFFF
+	resp.Response.Flush.Checksum = &corruptCRC
+	return resp
 }
 
 // dummyFlushResponse creates a single-row flush response for dummyTypedRow(rowKey, val),
@@ -380,4 +358,69 @@ func typedUncommittedAction(rows ...*btpb.TypedRow) *typedReadRowsAction {
 // dummyUncommittedAction returns a typedReadRowsAction that sends a single dummy row without a flush/resume token.
 func dummyUncommittedAction(rowKey, val string) *typedReadRowsAction {
 	return dummyTypedAction(rowKey, val, "")
+}
+
+// rawVal constructs a Value with RawValue set (used for unstructured row keys in requests/responses).
+func rawVal(b []byte) *btpb.Value {
+	return &btpb.Value{Kind: &btpb.Value_RawValue{RawValue: b}}
+}
+
+// makeStructRowKeySchema builds a TableSchema whose RowKeySchema has fields with the given types.
+func makeStructRowKeySchema(fieldTypes ...*btpb.Type) *btpb.TableSchema {
+	fields := make([]*btpb.Type_Struct_Field, len(fieldTypes))
+	for i, ft := range fieldTypes {
+		fields[i] = structField(fmt.Sprintf("part%d", i+1), ft)
+	}
+	return &btpb.TableSchema{
+		RowKeySchema: &btpb.Type_Struct{
+			Fields: fields,
+		},
+	}
+}
+
+// makeStructuredTypedRow creates a TypedRow whose RowKey is an ArrayValue of the given element Values.
+func makeStructuredTypedRow(keyParts []*btpb.Value, families ...*btpb.TypedFamily) *btpb.TypedRow {
+	return &btpb.TypedRow{
+		RowKey:   arrayVal(keyParts...),
+		Families: families,
+	}
+}
+
+// makeProxyTypedReadRowsRequest builds a testproxypb.TypedReadRowsRequest targeting tableID.
+func makeProxyTypedReadRowsRequest(t *testing.T, tableID string) *testproxypb.TypedReadRowsRequest {
+	return &testproxypb.TypedReadRowsRequest{
+		ClientId: t.Name(),
+		Request:  makeTypedReadRowsRequest(buildTableName(tableID)),
+	}
+}
+
+// assertResumeTokens verifies that the recorder received len(expectedTokens) requests and that
+// each request's ResumeToken matches the corresponding entry in expectedTokens (an empty string
+// asserts an empty ResumeToken). It returns the recorded requests in order.
+func assertResumeTokens(t *testing.T, recorder <-chan *typedReadRowsReqRecord, expectedTokens ...string) []*btpb.TypedReadRowsRequest {
+	t.Helper()
+	if !assert.Equal(t, len(expectedTokens), len(recorder), "unexpected number of recorded TypedReadRows requests") {
+		t.FailNow()
+	}
+	reqs := make([]*btpb.TypedReadRowsRequest, len(expectedTokens))
+	for i, wantTok := range expectedTokens {
+		rec := <-recorder
+		reqs[i] = rec.req
+		if wantTok == "" {
+			assert.Empty(t, rec.req.GetResumeToken(), "attempt %d expected empty resume_token", i+1)
+		} else {
+			assert.Equal(t, []byte(wantTok), rec.req.GetResumeToken(), "attempt %d resume_token mismatch", i+1)
+		}
+	}
+	return reqs
+}
+
+// assertTypedReadRowsFailure asserts that a TypedReadRows operation failed with a non-OK status
+// and yielded no rows.
+func assertTypedReadRowsFailure(t *testing.T, res *testproxypb.TypedRowsResult, msg string) {
+	t.Helper()
+	assert.NotNil(t, res)
+	assert.NotEqual(t, int32(codes.OK), res.GetStatus().GetCode(), msg)
+	assert.Empty(t, res.GetRows(), "rows must not be yielded on failure (%s)", msg)
+	t.Logf("The full error message is: %s", res.GetStatus().GetMessage())
 }
