@@ -18,6 +18,7 @@
 package tests
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -874,4 +876,658 @@ func TestTypedReadRows_Checksum_Corrupt_Fails(t *testing.T) {
 	assert.NotNil(t, res)
 	assert.Equal(t, int32(codes.Unavailable), res.GetStatus().GetCode())
 	assertTypedRowsEqual(t, []*btpb.TypedRow{row1}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_InitialTransientFailure verifies that if the stream fails with
+// an UNAVAILABLE error before any Flush has occurred -- both when the stream fails immediately
+// before any response and when it fails after delivering TableSchema plus uncommitted batch data --
+// the client discards the uncommitted data, retries from the start (empty resume_token), and
+// succeeds.
+func TestTypedReadRows_Resumption_InitialTransientFailure(t *testing.T) {
+	// 0. Common variables
+	uncommittedRow := makeDefaultTypedRow("row-init-uncommitted", "v-discarded")
+	row1 := makeDefaultTypedRow("row-init-fail", "v1")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	// 1. Instantiate the mock server
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedUncommittedAction(uncommittedRow),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedDefaultFlushAction("row-init-fail", "v1", "token-init-success"),
+	)
+
+	// 2. Build the request to test proxy
+	req := makeProxyTypedReadRowsRequest(t, "initial-transient-table")
+
+	// 3. Perform the operation via test proxy
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	// 4. Check the response
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "", "")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_DiscardsUncommittedOnDisconnect verifies that uncommitted rows
+// received after the last resume_token are discarded when the stream disconnects and reconnects.
+func TestTypedReadRows_Resumption_DiscardsUncommittedOnDisconnect(t *testing.T) {
+	// 0. Common variables
+	committedRow1 := makeDefaultTypedRow("committed-1", "v1")
+	committedRow2 := makeDefaultTypedRow("committed-2", "v2")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	// 1. Instantiate the mock server
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedDefaultFlushAction("committed-1", "v1", "token1"),
+		typedDefaultUncommittedAction("uncommitted-ghost", "ghost"),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedDefaultFlushAction("committed-2", "v2", "token2", committedRow1),
+	)
+
+	// 2. Build the request to test proxy
+	req := makeProxyTypedReadRowsRequest(t, "resumption-uncommitted-table")
+
+	// 3. Perform the operation via test proxy
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	// 4. Check the response
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token1")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{committedRow1, committedRow2}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_DisconnectMidChunk verifies that if a stream drops in the middle
+// of receiving multi-chunk fragmented batch data (before flush/token), the client purges its
+// partial uncommitted chunk buffer upon reconnection rather than concatenating stale fragments.
+func TestTypedReadRows_Resumption_DisconnectMidChunk(t *testing.T) {
+	// 0. Common variables
+	row1 := makeDefaultTypedRow("row-committed", "v1")
+	row2 := makeDefaultTypedRow("row-chunked-resumed", "a-longer-value-for-chunking-1234567890")
+
+	data1 := serializeTypedRows(row1)
+	data2 := serializeTypedRows(row2)
+	chunks := chunkedTypedResponses(data2, len(data2)/3, []byte("token2"), data1)
+
+	actions := []*typedReadRowsAction{typedDefaultFlushAction("row-committed", "v1", "token1")}
+	actions = append(actions, responsesToActions(chunks[:2]...)...)
+	actions = append(actions, &typedReadRowsAction{rpcError: codes.Unavailable})
+	actions = append(actions, responsesToActions(chunks...)...)
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	// 1. Instantiate the mock server
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, actions...)
+
+	// 2. Build the request to test proxy
+	req := makeProxyTypedReadRowsRequest(t, "midchunk-disconnect-table")
+
+	// 3. Perform the operation via test proxy
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	// 4. Check the response
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token1")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_FlushInSeparateMessage verifies that when the server separates
+// a multi-chunk data batch and the flush indicator into distinct messages, the client buffers
+// the chunks, commits on the subsequent standalone flush message, and resumes properly if dropped
+// thereafter.
+func TestTypedReadRows_Resumption_FlushInSeparateMessage(t *testing.T) {
+	row1 := makeDefaultTypedRow("row-sep-1", "value-long-enough-to-split-across-two-chunks")
+	row2 := makeDefaultTypedRow("row-sep-2", "v2")
+
+	data1 := serializeTypedRows(row1)
+	mid := len(data1) / 2
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		&typedReadRowsAction{
+			response: &btpb.TypedReadRowsResponse{
+				Response: &btpb.PartialRowResponse{
+					PartialRows: &btpb.PartialRowResponse_TypedRowsBatch{
+						TypedRowsBatch: &btpb.TypedRowsBatch{BatchData: data1[:mid]},
+					},
+				},
+			},
+		},
+		&typedReadRowsAction{
+			response: &btpb.TypedReadRowsResponse{
+				Response: &btpb.PartialRowResponse{
+					PartialRows: &btpb.PartialRowResponse_TypedRowsBatch{
+						TypedRowsBatch: &btpb.TypedRowsBatch{BatchData: data1[mid:]},
+					},
+				},
+			},
+		},
+		&typedReadRowsAction{
+			response: &btpb.TypedReadRowsResponse{
+				Response: &btpb.PartialRowResponse{
+					Flush: makeFlushResponse("token-sep-msg-1", []*btpb.TypedRow{row1}).GetResponse().GetFlush(),
+				},
+			},
+		},
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedUncommittedAction(row2),
+		&typedReadRowsAction{
+			response: &btpb.TypedReadRowsResponse{
+				Response: &btpb.PartialRowResponse{
+					Flush: makeFlushResponse("token-sep-msg-2", []*btpb.TypedRow{row2}, row1).GetResponse().GetFlush(),
+				},
+			},
+		},
+	)
+
+	req := makeProxyTypedReadRowsRequest(t, "sep-msg-table")
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token-sep-msg-1")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_MultipleSequentialDisconnects verifies that multiple cascading
+// stream disconnections (covering both UNAVAILABLE and ABORTED retryable status codes, including
+// an intermediate retry attempt that fails immediately before emitting any data or token) preserve
+// the latest resume_token and running checksum across attempts and accumulate the full set of rows
+// without loss or duplication.
+func TestTypedReadRows_Resumption_MultipleSequentialDisconnects(t *testing.T) {
+	// 0. Common variables
+	row1 := makeDefaultTypedRow("row-seq-1", "v1")
+	row2 := makeDefaultTypedRow("row-seq-2", "v2")
+	row3 := makeDefaultTypedRow("row-seq-3", "v3")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	// 1. Instantiate the mock server
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedDefaultFlushAction("row-seq-1", "v1", "token-seq-1"),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedDefaultFlushAction("row-seq-2", "v2", "token-seq-2", row1),
+		&typedReadRowsAction{rpcError: codes.Aborted},
+		&typedReadRowsAction{rpcError: codes.Unavailable}, // Immediate failure before any response on attempt 3
+		typedDefaultFlushAction("row-seq-3", "v3", "token-seq-3", row1, row2),
+	)
+
+	// 2. Build the request to test proxy
+	req := makeProxyTypedReadRowsRequest(t, "seq-disconnect-table")
+
+	// 3. Perform the operation via test proxy
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	// 4. Check the response
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token-seq-1", "token-seq-2", "token-seq-2")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2, row3}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_EmptyTableWithToken verifies that an empty table scan emitting
+// heartbeat resume_tokens both before a stream drop and on the resumed stream reconnects with
+// the first token, filters out the heartbeat marker rows, and completes with 0 rows.
+func TestTypedReadRows_Resumption_EmptyTableWithToken(t *testing.T) {
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedHeartbeatAction("token-empty-table-1"),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedHeartbeatAction("token-empty-table-2"),
+	)
+
+	req := makeProxyTypedReadRowsRequest(t, "empty-table-resumption")
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token-empty-table-1")
+	assert.Empty(t, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_MultipleSequentialHeartbeats verifies that intermediate sparse-query
+// heartbeats (flushes with resume_token but no batch data) after a committed batch preserve the
+// non-zero running checksum, advance the resume token across consecutive heartbeats, and allow the
+// client to resume from the latest heartbeat token upon disconnect.
+func TestTypedReadRows_Resumption_MultipleSequentialHeartbeats(t *testing.T) {
+	row1 := makeDefaultTypedRow("hb-crc-row-1", "payload-1")
+	row2 := makeDefaultTypedRow("hb-crc-row-2", "payload-2")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedDefaultFlushAction("hb-crc-row-1", "payload-1", "token-row1"),
+		typedHeartbeatAction("token-hb-1"),
+		typedHeartbeatAction("token-hb-2"),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedDefaultFlushAction("hb-crc-row-2", "payload-2", "token-row2", row1),
+	)
+
+	req := makeProxyTypedReadRowsRequest(t, "heartbeats-resumption-table")
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token-hb-2")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_CorruptChecksumRetriedFromLastGoodToken verifies that when a Flush
+// carries a corrupt checksum, the client rejects that Flush's resume_token and running checksum:
+//   - Attempt 1: corrupt first batch before any valid Flush -> retries from the start (empty
+//     resume_token) with runningChecksum still at 0.
+//   - Attempt 2: valid first batch ("token-1") followed by a corrupt second batch -> retries from
+//     "token-1" with runningChecksum rolled back to H(row1).
+//   - Attempt 3: valid second batch ("token-2", cumulative checksum H(row1, row2)) -> succeeds.
+func TestTypedReadRows_Resumption_CorruptChecksumRetriedFromLastGoodToken(t *testing.T) {
+	row1 := makeDefaultTypedRow("row1", "v1")
+	row2 := makeDefaultTypedRow("row2", "v2")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+	var attempt atomic.Int32
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = func(req *btpb.TypedReadRowsRequest, srv btpb.Bigtable_TypedReadRowsServer) error {
+		saveReqRecord(recorder, &typedReadRowsReqRecord{req: req, ts: time.Now()})
+		switch attempt.Add(1) {
+		case 1:
+			return srv.Send(makeCorruptFlushResponse("token-bad-1", []*btpb.TypedRow{row1}))
+		case 2:
+			if err := srv.Send(makeFlushResponse("token-1", []*btpb.TypedRow{row1})); err != nil {
+				return err
+			}
+			return srv.Send(makeCorruptFlushResponse("token-bad-2", []*btpb.TypedRow{row2}, row1))
+		default:
+			return srv.Send(makeFlushResponse("token-2", []*btpb.TypedRow{row2}, row1))
+		}
+	}
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "corrupt-checksum-retry-table"), nil)
+
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "", "token-1")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_RowSetUnmodified verifies that the client does NOT mutate the
+// request's TypedRowSet (or Filter or Reversed flag) when resuming after a retryable disconnect,
+// in both forward (reversed=false) and reverse (reversed=true) scan directions.
+//
+// This is the key behavioral difference from the v1 ReadRows protocol. There, the client had to
+// truncate the RowSet on retry -- shrinking the lower bound on forward scans and the upper bound on
+// reverse scans -- so already-returned rows were not re-read (see
+// TestReadRows_NoRetry_MultipleRowRanges and friends). In TypedReadRows all progress is carried by
+// the opaque resume_token, so the RowSet must be replayed verbatim regardless of scan direction.
+func TestTypedReadRows_Resumption_RowSetUnmodified(t *testing.T) {
+	for _, reversed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reversed_%v", reversed), func(t *testing.T) {
+			firstRow := makeDefaultTypedRow("row1", "v1")
+			secondRow := makeDefaultTypedRow("row2", "v2")
+			if reversed {
+				firstRow, secondRow = secondRow, firstRow
+			}
+
+			recorder := make(chan *typedReadRowsReqRecord, 10)
+
+			server := initMockServer(t)
+			server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+				typedFlushAction("token-r1", []*btpb.TypedRow{firstRow}),
+				&typedReadRowsAction{rpcError: codes.Unavailable},
+				typedFlushAction("token-r2", []*btpb.TypedRow{secondRow}, firstRow),
+			)
+
+			req := makeProxyTypedReadRowsRequest(t, "rowset-unmodified-table")
+			req.Request.Reversed = reversed
+			// Unstructured scan, so row keys and range bounds are raw_value -- the same kind the
+			// client requires on the response side.
+			req.Request.Rows = &btpb.TypedRowSet{
+				RowKeys: []*btpb.Value{
+					rawVal([]byte("row1")),
+					rawVal([]byte("row2")),
+				},
+				RowPrefixes: []*btpb.Value{
+					arrayVal(strVal("pref-")),
+				},
+				RowRanges: []*btpb.TypedValueRange{
+					{
+						StartValue: &btpb.TypedValueRange_StartValueClosed{StartValueClosed: rawVal([]byte("row0"))},
+						EndValue:   &btpb.TypedValueRange_EndValueOpen{EndValueOpen: rawVal([]byte("row9"))},
+					},
+				},
+			}
+			req.Request.Filter = &btpb.RowFilter{
+				Filter: &btpb.RowFilter_PassAllFilter{PassAllFilter: true},
+			}
+
+			res := doTypedReadRowsOp(t, server, req, nil)
+
+			checkResultOkStatus(t, res)
+			assertTypedRowsEqual(t, []*btpb.TypedRow{firstRow, secondRow}, res.Rows)
+
+			reqs := assertResumeTokens(t, recorder, "", "token-r1")
+			assert.Equal(t, reversed, reqs[0].GetReversed())
+			assert.Equal(t, reversed, reqs[1].GetReversed(), "reversed flag must be preserved on resume")
+
+			// The RowSet and Filter on the retry must be byte-for-byte what the caller supplied,
+			// and the entire request (aside from resume_token) must match between attempts.
+			if diff := cmp.Diff(req.Request.GetRows(), reqs[1].GetRows(), protocmp.Transform()); diff != "" {
+				t.Errorf("RowSet was modified on resume (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(req.Request.GetFilter(), reqs[1].GetFilter(), protocmp.Transform()); diff != "" {
+				t.Errorf("Filter was modified on resume (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(reqs[0], reqs[1], protocmp.Transform(), protocmp.IgnoreFields(&btpb.TypedReadRowsRequest{}, "resume_token")); diff != "" {
+				t.Errorf("Request differs between first attempt and retry (-first +retry):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestTypedReadRows_Resumption_RowsLimitUnmodified verifies that on retryable disconnect, the
+// client replays the original rows_limit unchanged (because the server encodes rows_read inside the
+// resume_token and nets the original rows_limit against it on resumption):
+//   - After Attempt 1 flushes 2 of 5 rows and disconnects, Attempt 2 replays rows_limit=5 (rather
+//     than decrementing to 3 as v1 ReadRows did).
+//   - After Attempt 2 flushes the remaining 3 of 5 rows (fulfilling rows_limit=5) and disconnects
+//     before stream completion, Attempt 3 still resumes with rows_limit=5 and token-r5 (rather than
+//     short-circuiting locally as v1 ReadRows did), and cleanly completes when the server closes
+//     the resumed stream immediately with 0 messages.
+func TestTypedReadRows_Resumption_RowsLimitUnmodified(t *testing.T) {
+	// 0. Common variables
+	row1 := makeDefaultTypedRow("row1", "v1")
+	row2 := makeDefaultTypedRow("row2", "v2")
+	row3 := makeDefaultTypedRow("row3", "v3")
+	row4 := makeDefaultTypedRow("row4", "v4")
+	row5 := makeDefaultTypedRow("row5", "v5")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	// 1. Instantiate the mock server
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedFlushAction("token-r2", []*btpb.TypedRow{row1, row2}),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedFlushAction("token-r5", []*btpb.TypedRow{row3, row4, row5}, []*btpb.TypedRow{row1, row2}),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		// Attempt 3 receives 0 messages (immediate EOF) because all 5 rows were already committed.
+	)
+
+	// 2. Build the request to test proxy
+	req := makeProxyTypedReadRowsRequest(t, "rows-limit-table")
+	req.Request.RowsLimit = 5
+
+	// 3. Perform the operation via test proxy
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	// 4. Check the response
+	checkResultOkStatus(t, res)
+	reqs := assertResumeTokens(t, recorder, "", "token-r2", "token-r5")
+	for i, r := range reqs {
+		assert.Equal(t, int64(5), r.GetRowsLimit(), "attempt %d rows_limit must remain 5", i+1)
+	}
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2, row3, row4, row5}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_RetryExhaustion verifies that when retryable errors exceed
+// the maximum retry limit (e.g. 3 retries), the client terminates and returns the UNAVAILABLE status.
+func TestTypedReadRows_Resumption_RetryExhaustion(t *testing.T) {
+	// 0. Common variables
+	row1 := makeDefaultTypedRow("row-before-outage", "v1")
+
+	var attempts atomic.Int32
+
+	// 1. Instantiate the mock server
+	server := initMockServer(t)
+	server.TypedReadRowsFn = func(req *btpb.TypedReadRowsRequest, srv btpb.Bigtable_TypedReadRowsServer) error {
+		n := attempts.Add(1)
+		if n == 1 {
+			assert.Empty(t, req.GetResumeToken())
+			// Commit row1
+			if err := srv.Send(makeFlushResponse("token-before-outage", []*btpb.TypedRow{row1})); err != nil {
+				return err
+			}
+			return status.Error(codes.Unavailable, "permanent backend failure")
+		}
+		// Continuous failure on retries
+		assert.Equal(t, []byte("token-before-outage"), req.GetResumeToken(), "retry attempt %d must resume from token-before-outage", n)
+		return status.Error(codes.Unavailable, "still failing")
+	}
+
+	// 2. Build the request to test proxy
+	req := makeProxyTypedReadRowsRequest(t, "exhaustion-table")
+
+	// 3. Perform the operation via test proxy
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	// 4. Check the response
+	// Ensure the client actually retried rather than giving up on the first error: at least
+	// 1 initial attempt + 3 retries.
+	//
+	// This encodes a retry budget rather than a protocol rule. A conformant client configured
+	// with a smaller budget would fail here through no fault of its own, so revisit this bound
+	// if the suite is run against a client other than Java.
+	assert.GreaterOrEqual(t, int(attempts.Load()), 4)
+	// Unlike the other failure tests, rows are expected here rather than asserted empty: row1
+	// was committed by a flush with a resume_token before the outage began, so it is durable and
+	// must survive the terminal error. Only *uncommitted* data must be withheld.
+	assert.NotNil(t, res)
+	assert.Equal(t, int32(codes.Unavailable), res.GetStatus().GetCode())
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1}, res.Rows)
+}
+
+// TestTypedReadRows_Resumption_NonRetryableErrorAfterDrop verifies that if the stream drops
+// with a retryable error, but the reconnected attempt encounters a non-retryable error
+// (e.g. PermissionDenied), the client preserves committed rows and surfaces the error status.
+func TestTypedReadRows_Resumption_NonRetryableErrorAfterDrop(t *testing.T) {
+	row1 := makeDefaultTypedRow("row-committed-before-perm-denied", "v1")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedDefaultFlushAction("row-committed-before-perm-denied", "v1", "token-perm-1"),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		&typedReadRowsAction{rpcError: codes.PermissionDenied},
+	)
+
+	req := makeProxyTypedReadRowsRequest(t, "permdenied-resumption-table")
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	assert.NotNil(t, res)
+	assert.Equal(t, int32(codes.PermissionDenied), res.GetStatus().GetCode())
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1}, res.Rows)
+	assertResumeTokens(t, recorder, "", "token-perm-1")
+}
+
+// TestTypedReadRows_Resumption_CancelAfterRows verifies that the user-visible stream can be
+// cancelled after cancel_after_rows rows have been surfaced across a stream resumption, that only
+// those rows are returned, and that the server stream context actually observes the cancellation.
+func TestTypedReadRows_Resumption_CancelAfterRows(t *testing.T) {
+	row1 := makeDefaultTypedRow("row-cancel-1", "v1")
+	row2 := makeDefaultTypedRow("row-cancel-2", "v2")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+	streamCtxErr := make(chan error, 1)
+	var attempt atomic.Int32
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = func(req *btpb.TypedReadRowsRequest, srv btpb.Bigtable_TypedReadRowsServer) error {
+		saveReqRecord(recorder, &typedReadRowsReqRecord{req: req, ts: time.Now()})
+		if attempt.Add(1) == 1 {
+			if err := srv.Send(makeFlushResponse("token-c1", []*btpb.TypedRow{row1})); err != nil {
+				return err
+			}
+			return status.Error(codes.Unavailable, "transient disconnect")
+		}
+		if err := srv.Send(makeFlushResponse("token-c2", []*btpb.TypedRow{row2}, row1)); err != nil {
+			return err
+		}
+		// Block until the client cancels the stream after receiving the 2nd row (or time out if
+		// cancellation is never propagated).
+		select {
+		case <-srv.Context().Done():
+			streamCtxErr <- srv.Context().Err()
+			return srv.Context().Err()
+		case <-time.After(5 * time.Second):
+			err := fmt.Errorf("timed out waiting for client stream cancellation")
+			streamCtxErr <- err
+			return err
+		}
+	}
+
+	req := makeProxyTypedReadRowsRequest(t, "cancel-resumption-table")
+	req.CancelAfterRows = 2
+
+	clientID := req.GetClientId()
+	setUp(t, server, clientID, nil)
+	defer tearDown(t, server, clientID)
+
+	res := doTypedReadRowsOpsCore(t, clientID, []*testproxypb.TypedReadRowsRequest{req}, nil)[0]
+
+	checkResultOkOrCancelledStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token-c1")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
+
+	select {
+	case err := <-streamCtxErr:
+		assert.ErrorIs(t, err, context.Canceled, "expected server stream context to be cancelled by client")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server handler to observe stream cancellation")
+	}
+}
+
+// TestTypedReadRows_Retry_WithRoutingCookie_MultipleErrorResponses verifies that the routing cookie
+// is carried forward across consecutive failures, retained when an error omits it, and replaced
+// when the server supplies a new one.
+func TestTypedReadRows_Retry_WithRoutingCookie_MultipleErrorResponses(t *testing.T) {
+	cookie := "test-cookie-trr"
+	newCookie := "new-test-cookie-trr"
+	row1 := makeDefaultTypedRow("row-01", "v1")
+	row5 := makeDefaultTypedRow("row-05", "v5")
+
+	mdRecords := make(chan metadata.MD, 10)
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFnWithMetadata(recorder, mdRecords,
+		typedDefaultFlushAction("row-01", "v1", "token-r1"),
+		&typedReadRowsAction{rpcError: codes.Unavailable, routingCookie: cookie},    // Error with a routing cookie
+		&typedReadRowsAction{rpcError: codes.Unavailable},                           // Error with no routing cookie
+		&typedReadRowsAction{rpcError: codes.Unavailable, routingCookie: newCookie}, // Error with new routing cookie
+		typedDefaultFlushAction("row-05", "v5", "token-r5", row1),
+	)
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "routing-cookie-multi-table"), nil)
+
+	checkResultOkStatus(t, res)
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row5}, res.Rows)
+	if !assert.Equal(t, 4, len(mdRecords)) {
+		t.FailNow()
+	}
+	for i, wantCookie := range []string{"", cookie, cookie, newCookie} {
+		md := <-mdRecords
+		val := md["x-goog-cbt-cookie-test"]
+		if wantCookie == "" {
+			assert.Empty(t, val, "request #%d must not include routing cookie", i+1)
+		} else {
+			assert.NotEmpty(t, val, "request #%d must include routing cookie", i+1)
+			if len(val) > 0 {
+				assert.Equal(t, wantCookie, val[0], "request #%d routing cookie mismatch", i+1)
+			}
+		}
+	}
+	assertResumeTokens(t, recorder, "", "token-r1", "token-r1", "token-r1")
+}
+
+// TestTypedReadRows_Retry_WithRetryInfo_MultipleErrorResponses verifies that a server-provided
+// RetryInfo delay governs the next attempt, and that a backoff delay is still applied after a
+// subsequent error that omits RetryInfo.
+func TestTypedReadRows_Retry_WithRetryInfo_MultipleErrorResponses(t *testing.T) {
+	row1 := makeDefaultTypedRow("row-01", "v1")
+	row5 := makeDefaultTypedRow("row-05", "v5")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedDefaultFlushAction("row-01", "v1", "token-r1"),
+		&typedReadRowsAction{rpcError: codes.Unavailable, retryInfo: "2s"}, // Error with retry info
+		&typedReadRowsAction{rpcError: codes.Unavailable},                  // Second error without retry info
+		typedDefaultFlushAction("row-05", "v5", "token-r5", row1),
+	)
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "retry-info-multi-table"), nil)
+
+	checkResultOkStatus(t, res)
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row5}, res.Rows)
+	if !assert.Equal(t, 3, len(recorder)) {
+		t.FailNow()
+	}
+	firstReq := <-recorder
+	retryReq1 := <-recorder
+	retryReq2 := <-recorder
+
+	// Initial request has empty resume_token; both retries resume from the committed token.
+	assert.Empty(t, firstReq.req.GetResumeToken())
+	assert.Equal(t, []byte("token-r1"), retryReq1.req.GetResumeToken())
+	assert.Equal(t, []byte("token-r1"), retryReq2.req.GetResumeToken())
+
+	// The server-specified delay must be honored on the first retry, and the second retry
+	// must still apply a backoff delay (> initial 10ms delay) when no RetryInfo is present.
+	assert.True(t, retryReq1.ts.Sub(firstReq.ts) >= 2*time.Second,
+		"expected the RetryInfo delay of 2s to be respected")
+	assert.True(t, retryReq2.ts.Sub(retryReq1.ts) > 10*time.Millisecond,
+		"expected backoff delay after an error without RetryInfo")
+}
+
+// TestTypedReadRows_Retry_WithRetryInfo_OverallDeadline verifies that RetryInfo delays cannot push
+// an operation past the overall call deadline.
+func TestTypedReadRows_Retry_WithRetryInfo_OverallDeadline(t *testing.T) {
+	row1 := makeDefaultTypedRow("row-01", "v1")
+
+	// There should only be 2 attempts due to the effect of client side timeout.
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedDefaultFlushAction("row-01", "v1", "token-r1"),
+		&typedReadRowsAction{rpcError: codes.Unavailable, retryInfo: "2s"},
+		&typedReadRowsAction{rpcError: codes.Unavailable, retryInfo: "6s"},
+		typedDefaultFlushAction("row-05", "v5", "token-r5", row1),
+	)
+
+	req := makeProxyTypedReadRowsRequest(t, "retry-info-deadline-table")
+	opts := clientOpts{
+		timeout: &durationpb.Duration{Seconds: 3},
+	}
+
+	res := doTypedReadRowsOp(t, server, req, &opts)
+
+	assert.NotNil(t, res)
+	gotCode := codes.Code(res.GetStatus().GetCode())
+	assert.True(t, gotCode == codes.DeadlineExceeded || gotCode == codes.Unavailable,
+		"expected DeadlineExceeded or Unavailable when RetryInfo exceeds overall deadline, got %v", gotCode)
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1}, res.Rows)
+
+	// 3s deadline is far below the combined 2s + 6s of server-requested delay, so the operation
+	// must give up rather than sleeping through it.
+	if !assert.Equal(t, 2, len(recorder)) {
+		t.FailNow()
+	}
+	firstReq := <-recorder
+	retryReq := <-recorder
+	assert.Empty(t, firstReq.req.GetResumeToken())
+	assert.Equal(t, []byte("token-r1"), retryReq.req.GetResumeToken())
+
+	curTs := time.Now()
+	assert.GreaterOrEqual(t, retryReq.ts.Sub(firstReq.ts), 2*time.Second,
+		"expected the first RetryInfo delay of 2s to be respected")
+	assert.Less(t, curTs.Sub(firstReq.ts), 4*time.Second)
 }
