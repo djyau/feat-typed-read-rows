@@ -1531,3 +1531,292 @@ func TestTypedReadRows_Retry_WithRetryInfo_OverallDeadline(t *testing.T) {
 		"expected the first RetryInfo delay of 2s to be respected")
 	assert.Less(t, curTs.Sub(firstReq.ts), 4*time.Second)
 }
+
+// TestTypedReadRows_MissingInitialTableSchema_Fails verifies that when the server omits TableSchema
+// on the very first message of the stream, the client rejects that first message immediately even
+// if a subsequent message on the stream provides TableSchema before the Flush.
+func TestTypedReadRows_MissingInitialTableSchema_Fails(t *testing.T) {
+	row := makeDefaultTypedRow("row-no-schema", "v")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+	server := initMockServer(t)
+	server.DisableTypedReadRowsAutoSchema = true
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedUncommittedAction(row),
+		&typedReadRowsAction{
+			response: &btpb.TypedReadRowsResponse{
+				TableSchema: &btpb.TableSchema{},
+				Response: &btpb.PartialRowResponse{
+					Flush: makeFlushResponse("token-no-schema", []*btpb.TypedRow{row}).GetResponse().GetFlush(),
+				},
+			},
+		},
+	)
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "missing-schema-table"), nil)
+
+	assertTypedReadRowsFailure(t, res, "expected failure when the initial TableSchema is missing")
+	assertResumeTokens(t, recorder, "")
+}
+
+// TestTypedReadRows_Resumption_MissingTableSchemaOnRetry_Fails verifies that every reconnected
+// stream attempt must also provide TableSchema on its first response, and that if the resumed
+// stream omits TableSchema on its first response (even if a second response on the resumed stream
+// provides TableSchema before flushing), the read fails while preserving rows committed on the
+// earlier attempt.
+func TestTypedReadRows_Resumption_MissingTableSchemaOnRetry_Fails(t *testing.T) {
+	row1 := makeDefaultTypedRow("row1", "v1")
+	row2 := makeDefaultTypedRow("row2", "v2")
+	resp1 := makeFlushResponse("token-1", []*btpb.TypedRow{row1})
+	resp1.TableSchema = &btpb.TableSchema{}
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.DisableTypedReadRowsAutoSchema = true
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		&typedReadRowsAction{response: resp1},
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedUncommittedAction(row2),
+		&typedReadRowsAction{
+			response: &btpb.TypedReadRowsResponse{
+				TableSchema: &btpb.TableSchema{},
+				Response: &btpb.PartialRowResponse{
+					Flush: makeFlushResponse("token-2", []*btpb.TypedRow{row2}, row1).GetResponse().GetFlush(),
+				},
+			},
+		},
+	)
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "missing-schema-on-retry-table"), nil)
+
+	assert.NotNil(t, res)
+	assert.NotEqual(t, int32(codes.OK), res.GetStatus().GetCode(), "expected failure when the resumed stream omits TableSchema on its first response")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1}, res.Rows)
+	assertResumeTokens(t, recorder, "", "token-1")
+}
+
+// TestTypedReadRows_SchemaRowKeyKindMismatch_Fails verifies that the client enforces agreement
+// between TableSchema and the kind of Value carrying each row key, in both directions:
+//
+//   - row_key_schema present => row keys must arrive as array_value
+//   - row_key_schema absent  => row keys must arrive as raw_value
+//
+// Aside from parsing the schema's own Type definitions (see InvalidRowKeySchemaType_Fails), that
+// kind check is the only cross-check between TableSchema and each row's key: per-row ArrayValue
+// elements are not validated against the schema's field types or arity -- a one-field schema
+// accepts a four-element key -- so a mismatch in the row key's top-level Value kind is the sole
+// row-level schema violation a client can detect, and both directions of it are worth pinning down.
+func TestTypedReadRows_SchemaRowKeyKindMismatch_Fails(t *testing.T) {
+	structuredSchema := makeStructRowKeySchema(strType())
+	rawKeyRow := makeDefaultTypedRow("row-raw-key", "v")
+	arrayKeyRow := makeStructuredTypedRow(
+		[]*btpb.Value{strVal("part1-val")},
+		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v")))),
+	)
+
+	testCases := []struct {
+		name             string
+		schema           *btpb.TableSchema
+		row              *btpb.TypedRow
+		useStructuredKey bool
+	}{
+		{"structured schema with raw_value key", structuredSchema, rawKeyRow, true},
+		{"unstructured schema with array_value key", &btpb.TableSchema{}, arrayKeyRow, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := makeFlushResponse("token-mismatch", []*btpb.TypedRow{tc.row})
+			resp.TableSchema = tc.schema
+
+			recorder := make(chan *typedReadRowsReqRecord, 10)
+			server := initMockServer(t)
+			server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{response: resp})
+
+			req := makeProxyTypedReadRowsRequest(t, "schema-mismatch-table")
+			req.Request.RowKeyFormat = &btpb.TypedReadRowsRequest_UseStructuredKey{UseStructuredKey: tc.useStructuredKey}
+			res := doTypedReadRowsOp(t, server, req, nil)
+
+			assertTypedReadRowsFailure(t, res, "expected failure for "+tc.name)
+			assertResumeTokens(t, recorder, "")
+		})
+	}
+}
+
+// TestTypedReadRows_InvalidRowKeySchemaType_Fails verifies that when TableSchema.row_key_schema
+// contains a field with an unset/invalid Type (KIND_NOT_SET), the client rejects the schema and
+// fails the read without retrying.
+//
+// The row key uses a null element (nullVal()) so that the test proxy's row-key serializer would
+// never inspect the field's Type code on its own, isolating the failure to the client's eager
+// TableSchema validation.
+func TestTypedReadRows_InvalidRowKeySchemaType_Fails(t *testing.T) {
+	invalidSchema := makeStructRowKeySchema(&btpb.Type{})
+	row := makeStructuredTypedRow(
+		[]*btpb.Value{nullVal()},
+		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v")))),
+	)
+	resp := makeFlushResponse("token-invalid-type", []*btpb.TypedRow{row})
+	resp.TableSchema = invalidSchema
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{response: resp})
+
+	req := makeProxyTypedReadRowsRequest(t, "invalid-schema-type-table")
+	req.Request.RowKeyFormat = &btpb.TypedReadRowsRequest_UseStructuredKey{UseStructuredKey: true}
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	assertTypedReadRowsFailure(t, res, "expected failure when row_key_schema has an invalid/unset field type")
+	assertResumeTokens(t, recorder, "")
+}
+
+// TestTypedReadRows_MidStream_SchemaEvolution verifies that the client re-reads TableSchema on
+// every response that provides one rather than latching the first one it sees or ignoring an empty
+// TableSchema{}.
+//
+// Per Table.row_key_schema invariants, the only supported row key schema updates are:
+//  1. Updating from an empty schema (unstructured raw_value keys) to a new structured schema.
+//  2. Removing an existing structured schema (reverting to unstructured raw_value keys).
+//
+// Each constructed TypedRow retains the TableSchema active when its batch was flushed, and the
+// test proxy reconstructs the output row key's ArrayValue by iterating over
+// row.getTableSchema().getRowKeySchema().getFields(). Therefore, both transitions are directly
+// observable:
+//   - If the client latches schema1 (empty), batch 2's structured key fails with
+//     "Unstructured row keys must be provided as a raw_value Value."
+//   - If the client treats schema3 (empty TableSchema{}) as a no-op and keeps schema2, batch 3's
+//     raw_value key fails with "Structured row keys must be provided as an array_value Value."
+func TestTypedReadRows_MidStream_SchemaEvolution(t *testing.T) {
+	// Response 1 has an empty schema (unstructured raw_value row key)...
+	schema1 := &btpb.TableSchema{}
+	// ...response 2 adds a 2-field structured row_key_schema (STRING, INT64)...
+	schema2 := makeStructRowKeySchema(strType(), int64Type())
+	// ...and response 3 removes row_key_schema, reverting to unstructured raw_value row keys.
+	schema3 := &btpb.TableSchema{}
+
+	row1 := makeDefaultTypedRow("row-unstructured-1", "val1")
+	row2 := makeStructuredTypedRow(
+		[]*btpb.Value{strVal("val2"), intVal(99)},
+		makeTypedFamily("cf",
+			makeTypedColumn([]byte("col1"), makeTypedCell([]byte("val2"))),
+		),
+	)
+	row3 := makeDefaultTypedRow("row-unstructured-3", "val3")
+
+	resp1 := makeDefaultFlushResponse("row-unstructured-1", "val1", "token-1")
+	resp1.TableSchema = schema1
+	resp2 := makeFlushResponse("token-2", []*btpb.TypedRow{row2}, row1)
+	resp2.TableSchema = schema2
+	resp3 := makeDefaultFlushResponse("row-unstructured-3", "val3", "token-3", row1, row2)
+	resp3.TableSchema = schema3
+
+	server := initMockServer(t)
+	// All responses set TableSchema explicitly, so auto-schema would not fire anyway; disabling
+	// it makes the intent unambiguous.
+	server.DisableTypedReadRowsAutoSchema = true
+	server.TypedReadRowsFn = mockTypedReadRowsFn(nil, responsesToActions(resp1, resp2, resp3)...)
+
+	req := makeProxyTypedReadRowsRequest(t, "schema-evolution-table")
+	req.Request.RowKeyFormat = &btpb.TypedReadRowsRequest_UseStructuredKey{UseStructuredKey: true}
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	checkResultOkStatus(t, res)
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2, row3}, res.Rows)
+}
+
+// TestTypedReadRows_StructuredRowKeys_Resumption verifies reading and resuming across a stream
+// disconnect with multi-field structured row keys covering all 8 supported structured row key data
+// types (String, Bytes, Int64, Float64, Float32, Bool, Timestamp, Date), zero-valued non-null
+// scalars, null (KIND_NOT_SET) elements across every type, and subsequent responses in the same
+// stream omitting TableSchema (since the server only populates table_schema on the first response
+// of each stream).
+func TestTypedReadRows_StructuredRowKeys_Resumption(t *testing.T) {
+	schema := makeStructRowKeySchema(
+		strType(),
+		bytesType(),
+		int64Type(),
+		float64Type(),
+		float32Type(),
+		boolType(),
+		timestampType(),
+		dateType(),
+		strType(),
+	)
+
+	row1 := makeStructuredTypedRow(
+		[]*btpb.Value{
+			strVal("tenant-a"),
+			bytesVal([]byte{0x01, 0x02}),
+			intVal(100),
+			floatVal(3.141592653589793),
+			floatVal(1.5),
+			boolVal(true),
+			timestampVal(1700000000, 123456000),
+			dateVal(2026, 3, 25),
+			nullVal(), // Null element (KIND_NOT_SET)
+		},
+		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v1")))),
+	)
+	// row2 exercises zero/empty non-null scalar values (whose oneof discriminator is set,
+	// distinct from KIND_NOT_SET in row3).
+	row2 := makeStructuredTypedRow(
+		[]*btpb.Value{
+			strVal(""),
+			bytesVal([]byte{}),
+			intVal(0),
+			floatVal(0.0),
+			floatVal(0.0),
+			boolVal(false),
+			timestampVal(0, 0),
+			dateVal(1970, 1, 1),
+			strVal("non-null-tag"),
+		},
+		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v2")))),
+	)
+	// row3 exercises NULL (KIND_NOT_SET) across all 8 supported structured row key scalar types.
+	row3 := makeStructuredTypedRow(
+		[]*btpb.Value{
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+			nullVal(),
+		},
+		makeTypedFamily("cf", makeTypedColumn([]byte("c"), makeTypedCell([]byte("v3")))),
+	)
+
+	resp1 := makeFlushResponse("token-srk-1", []*btpb.TypedRow{row1})
+	resp1.TableSchema = schema
+	resp2 := makeFlushResponse("token-srk-2", []*btpb.TypedRow{row2}, row1)
+	resp2.TableSchema = schema
+	// Subsequent response on the same stream omits TableSchema to verify the client retains
+	// the stream's initial TableSchema across batches within a stream.
+	resp3 := makeFlushResponse("token-srk-3", []*btpb.TypedRow{row3}, row1, row2)
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		&typedReadRowsAction{response: resp1},
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		&typedReadRowsAction{response: resp2},
+		&typedReadRowsAction{response: resp3},
+	)
+
+	req := makeProxyTypedReadRowsRequest(t, "structured-row-keys-resumption-table")
+	req.Request.RowKeyFormat = &btpb.TypedReadRowsRequest_UseStructuredKey{UseStructuredKey: true}
+
+	res := doTypedReadRowsOp(t, server, req, nil)
+
+	checkResultOkStatus(t, res)
+	reqs := assertResumeTokens(t, recorder, "", "token-srk-1")
+	assert.True(t, reqs[0].GetUseStructuredKey())
+	assert.True(t, reqs[1].GetUseStructuredKey(), "use_structured_key must be preserved on resume")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2, row3}, res.Rows)
+}
