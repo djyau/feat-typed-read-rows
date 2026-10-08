@@ -733,3 +733,104 @@ func mockPrepareQueryFnWithMetadata(recorder chan<- *prepareQueryReqRecord, mdRe
 		return action.response, nil
 	}
 }
+
+// mockTypedReadRowsFn is a simple wrapper of mockTypedReadRowsFnWithMetadata. It's useful when the
+// server serves a single stream (including its retries) from one action sequence, which is the
+// case for all non-concurrency tests.
+//
+// NOTE: despite the similar shape, this does NOT behave like mockReadRowsFnSimple. There, the
+// variadic actions are expanded so that each action serves a separate concurrent operation; here
+// they form ONE sequence consumed by a single operation across all of its attempts. This is the
+// common case for TypedReadRows, whose tests are dominated by multi-message streams (send a batch,
+// disconnect, resume). For concurrency testing use mockTypedReadRowsFnMultiOp instead.
+func mockTypedReadRowsFn(recorder chan<- *typedReadRowsReqRecord, actionSequence ...*typedReadRowsAction) func(*btpb.TypedReadRowsRequest, btpb.Bigtable_TypedReadRowsServer) error {
+	return mockTypedReadRowsFnWithMetadata(recorder, nil, actionSequence...)
+}
+
+// mockTypedReadRowsFnWithMetadata is the single-op form of mockTypedReadRowsFnMultiOpWithMetadata.
+func mockTypedReadRowsFnWithMetadata(recorder chan<- *typedReadRowsReqRecord, mdRecorder chan metadata.MD, actionSequence ...*typedReadRowsAction) func(*btpb.TypedReadRowsRequest, btpb.Bigtable_TypedReadRowsServer) error {
+	return mockTypedReadRowsFnMultiOpWithMetadata(recorder, mdRecorder, actionSequence)
+}
+
+func mockTypedReadRowsFnMultiOp(recorder chan<- *typedReadRowsReqRecord, actionSequences ...[]*typedReadRowsAction) func(*btpb.TypedReadRowsRequest, btpb.Bigtable_TypedReadRowsServer) error {
+	return mockTypedReadRowsFnMultiOpWithMetadata(recorder, nil, actionSequences...)
+}
+
+// mockTypedReadRowsFnMultiOpWithMetadata returns a mock implementation of server-side
+// TypedReadRows(). The behavior is customized by `actionSequences`. Non-nil `recorder` will be used
+// to log the requests (including retries) received by the server in time order, up to its capacity.
+// For concurrency testing, each request MUST have prefix "opX-" in the row key(s), indicating
+// that the X-th (zero based) actionSequence will be used to serve the request.
+func mockTypedReadRowsFnMultiOpWithMetadata(recorder chan<- *typedReadRowsReqRecord, mdRecorder chan metadata.MD, actionSequences ...[]*typedReadRowsAction) func(*btpb.TypedReadRowsRequest, btpb.Bigtable_TypedReadRowsServer) error {
+	// Build the map so that server can retrieve the proper action queue by key "opX-".
+	opIDToActionQueue := make(map[string]chan *typedReadRowsAction)
+	buildActionMap(opIDToActionQueue, actionSequences)
+
+	return func(req *btpb.TypedReadRowsRequest, srv btpb.Bigtable_TypedReadRowsServer) error {
+		if *printClientReq {
+			serverLogger.Printf("Request from client: %+v", req)
+		}
+
+		// Record the metadata
+		if mdRecorder != nil {
+			md, _ := metadata.FromIncomingContext(srv.Context())
+			select {
+			case mdRecorder <- md:
+			default:
+				serverLogger.Printf("Metadata is not saved as the mdRecorder runs out of capacity: %d", cap(mdRecorder))
+			}
+		}
+
+		// Record the request
+		reqRecord := &typedReadRowsReqRecord{
+			req: req,
+			ts:  time.Now(),
+		}
+		saveReqRecord(recorder, reqRecord)
+
+		// Select the actions to perform
+		var rowKey []byte
+		if req.GetRows() != nil && len(req.GetRows().GetRowKeys()) > 0 {
+			rowKey = req.GetRows().GetRowKeys()[0].GetRawValue()
+		} else if len(opIDToActionQueue) > 1 {
+			return gs.Error(codes.InvalidArgument, "The TypedReadRows request must contain rowkeys for concurrency testing")
+		}
+
+		actionQueue, err := retrieveActions(opIDToActionQueue, rowKey)
+		if err != nil {
+			return err
+		}
+
+		// Perform the actions
+		for {
+			action, more := <-actionQueue
+			if !more {
+				break
+			}
+			sleepFor(action.delayStr)
+
+			if action.rpcError != codes.OK {
+				if action.routingCookie != "" {
+					trailer := metadata.Pairs("x-goog-cbt-cookie-test", action.routingCookie)
+					srv.SetTrailer(trailer)
+				}
+				if action.retryInfo != "" {
+					st := gs.New(action.rpcError, "TypedReadRows failed")
+					delay, _ := time.ParseDuration(action.retryInfo)
+					retryInfo := &errdetails.RetryInfo{
+						RetryDelay: drpb.New(delay),
+					}
+					st, _ = st.WithDetails(retryInfo)
+					return st.Err()
+				}
+				return gs.Error(action.rpcError, "TypedReadRows failed")
+			}
+			if action.response != nil {
+				if err := srv.Send(action.response); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+}
