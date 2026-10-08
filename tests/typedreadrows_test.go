@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -589,4 +590,288 @@ func TestTypedReadRows_Generic_CloseClient(t *testing.T) {
 		}
 		assertTypedReadRowsFailure(t, resultsBatchTwo[i], "expected post-close request to fail")
 	}
+}
+
+// TestTypedReadRows_ArbitraryChunkFragmentation verifies stream reassembly across various arbitrary
+// chunk sizes (including the degenerate case of one byte per response) across two consecutive
+// fragmented batches on the same stream.
+func TestTypedReadRows_ArbitraryChunkFragmentation(t *testing.T) {
+	row1 := makeTypedRow([]byte("row1-long-key-for-chunking-test"),
+		makeTypedFamily("cf-data",
+			makeTypedColumn([]byte("col-a"), makeTypedCell([]byte("payload-value-1234567890abcdefghijklmnopqrstuvwxyz"))),
+			makeTypedColumn([]byte("col-b"), makeTypedCell([]byte("another-value-ABCDEFGHIJKLMNOPQRSTUVWXYZ"))),
+		),
+	)
+	row2 := makeTypedRow([]byte("row2-long-key-for-chunking-test"),
+		makeTypedFamily("cf-data",
+			makeTypedColumn([]byte("col-c"), makeTypedCell([]byte("third-value-!@#$%^&*()_+"))),
+		),
+	)
+	row3 := makeTypedRow([]byte("row3-second-fragmented-batch"),
+		makeTypedFamily("cf-data",
+			makeTypedColumn([]byte("col-d"), makeTypedCell([]byte("second-batch-payload-0987654321"))),
+		),
+	)
+
+	batch1Data := serializeTypedRows(row1, row2)
+	batch2Data := serializeTypedRows(row3)
+
+	for _, chunkSize := range []int{1, 2, 3, 7, 15, 23} {
+		t.Run(fmt.Sprintf("ChunkSize_%d", chunkSize), func(t *testing.T) {
+			responses := chunkedTypedResponses(batch1Data, chunkSize, []byte("token-frag-1"))
+			responses = append(responses, chunkedTypedResponses(batch2Data, chunkSize, []byte("token-frag-2"), batch1Data)...)
+
+			server := initMockServer(t)
+			server.TypedReadRowsFn = mockTypedReadRowsFn(nil, responsesToActions(responses...)...)
+
+			res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "test-table"), nil)
+
+			checkResultOkStatus(t, res)
+			assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2, row3}, res.Rows)
+		})
+	}
+}
+
+// TestTypedReadRows_Reset_WithDataInSameResponse verifies the ordering the protocol mandates when
+// reset arrives alongside other fields: "any data buffered since the last non-empty `resume_token`
+// must be discarded before the other parts of this message, if any, are handled." Here the reset,
+// a fresh batch, and the flush that commits it all travel in a single response. A client that
+// appended the batch first and applied the reset afterwards would discard the new data instead of
+// the stale data, yielding row1 alone.
+func TestTypedReadRows_Reset_WithDataInSameResponse(t *testing.T) {
+	row1 := makeDefaultTypedRow("row1", "committed-1")
+	row2 := makeDefaultTypedRow("row2", "committed-2")
+
+	resetWithData := makeDefaultFlushResponse("row2", "committed-2", "token-row2", row1)
+	resetWithData.Response.Reset_ = true
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(nil,
+		typedDefaultFlushAction("row1", "committed-1", "token-row1"),
+		typedDefaultUncommittedAction("row2", "uncommitted-2"),
+		&typedReadRowsAction{response: resetWithData},
+	)
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "test-table"), nil)
+
+	checkResultOkStatus(t, res)
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1, row2}, res.Rows)
+}
+
+// TestTypedReadRows_Reset_DiscardsUncommittedPreservesToken verifies that reset=true:
+//   - discards a partially received unparseable fragment when no resume_token has been seen yet,
+//   - is a harmless no-op when a second back-to-back reset arrives on an already-empty buffer, and
+//   - when arriving as a standalone message after a committed batch, preserves the committed
+//     resume_token and running checksum across a subsequent stream disconnect.
+func TestTypedReadRows_Reset_DiscardsUncommittedPreservesToken(t *testing.T) {
+	garbageRow := makeDefaultTypedRow("row-discarded", "this-value-is-long-enough-to-fragment")
+	validRow1 := makeDefaultTypedRow("row-after-reset", "v1")
+	validRow2 := makeDefaultTypedRow("row-after-resume", "v2")
+
+	garbageData := serializeTypedRows(garbageRow)
+	partial := garbageData[:len(garbageData)/3]
+	partialAction := &typedReadRowsAction{
+		response: &btpb.TypedReadRowsResponse{
+			Response: &btpb.PartialRowResponse{
+				PartialRows: &btpb.PartialRowResponse_TypedRowsBatch{
+					TypedRowsBatch: &btpb.TypedRowsBatch{BatchData: partial},
+				},
+			},
+		},
+	}
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		partialAction,
+		typedResetAction(),
+		typedResetAction(),
+		typedDefaultFlushAction("row-after-reset", "v1", "token-after-reset"),
+		partialAction,
+		typedResetAction(),
+		&typedReadRowsAction{rpcError: codes.Unavailable},
+		typedDefaultFlushAction("row-after-resume", "v2", "token-after-resume", validRow1),
+	)
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "test-table"), nil)
+
+	checkResultOkStatus(t, res)
+	assertResumeTokens(t, recorder, "", "token-after-reset")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{validRow1, validRow2}, res.Rows)
+}
+
+// TestTypedReadRows_UnflushedDataAtStreamEnd_Fails verifies that batch data which is never
+// committed by a Flush is not yielded to the caller, even though the stream ends cleanly, while
+// rows committed by an earlier Flush before the incomplete tail are preserved.
+func TestTypedReadRows_UnflushedDataAtStreamEnd_Fails(t *testing.T) {
+	committedRow := makeDefaultTypedRow("row-committed", "val-committed")
+	uncommittedRow := makeDefaultTypedRow("row-no-flush", "val-no-flush")
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder,
+		typedFlushAction("token-1", []*btpb.TypedRow{committedRow}),
+		typedUncommittedAction(uncommittedRow),
+	)
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "test-table"), nil)
+
+	assert.NotNil(t, res)
+	assert.NotEqual(t, int32(codes.OK), res.GetStatus().GetCode(), "expected failure when the stream ends with unflushed data")
+	assertTypedRowsEqual(t, []*btpb.TypedRow{committedRow}, res.Rows)
+	assertResumeTokens(t, recorder, "")
+}
+
+// TestTypedReadRows_InvalidProtobuf_Fails verifies that a batch whose bytes are not a valid
+// TypedRows message is rejected rather than surfaced as rows.
+//
+// The flush carries a valid CRC32C checksum over the malformed bytes so that the checksum passes
+// and the failure is isolated to protobuf parsing (rather than failing earlier on checksum
+// validation). Unlike Checksum_Corrupt_Fails, a one-shot action queue is sufficient because a
+// protobuf parse failure is not retryable.
+func TestTypedReadRows_InvalidProtobuf_Fails(t *testing.T) {
+	badBytes := []byte{0xFF, 0xFF, 0xFF, 0xFF}
+	crc := batchChecksum(badBytes)
+	resp := &btpb.TypedReadRowsResponse{
+		Response: &btpb.PartialRowResponse{
+			PartialRows: &btpb.PartialRowResponse_TypedRowsBatch{
+				TypedRowsBatch: &btpb.TypedRowsBatch{
+					BatchData: badBytes,
+				},
+			},
+			Flush: &btpb.PartialRowResponse_Flush{
+				Checksum:    &crc,
+				ResumeToken: []byte("token"),
+			},
+		},
+	}
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{response: resp})
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "test-table"), nil)
+
+	assertTypedReadRowsFailure(t, res, "expected failure on unparseable batch data")
+	assertResumeTokens(t, recorder, "")
+}
+
+// TestTypedReadRows_MissingResumeToken_Fails verifies that a Flush with an empty resume_token is
+// rejected both when committing a non-empty batch and when arriving as an empty heartbeat Flush.
+//
+// Unlike ExecuteQuery's PartialResultSet (where batch_checksum and resume_token are independent
+// top-level fields and un-checkpointed rows stay buffered in `queue`), PartialRowResponse.Flush
+// combines checksum verification with immediately releasing buffered rows to the caller. Because
+// Flush is the sole commit boundary in TypedReadRows, releasing rows without a non-empty
+// resume_token would either clobber the saved resumption token with "" or leave the client unable
+// to resume after a transient error without duplicating already-yielded rows.
+func TestTypedReadRows_MissingResumeToken_Fails(t *testing.T) {
+	row := makeDefaultTypedRow("row1", "v")
+	data := serializeTypedRows(row)
+	crc := batchChecksum(data)
+
+	tests := []struct {
+		name string
+		resp *btpb.TypedReadRowsResponse
+	}{
+		{
+			name: "non_empty_batch",
+			resp: &btpb.TypedReadRowsResponse{
+				Response: &btpb.PartialRowResponse{
+					PartialRows: &btpb.PartialRowResponse_TypedRowsBatch{
+						TypedRowsBatch: &btpb.TypedRowsBatch{BatchData: data},
+					},
+					Flush: &btpb.PartialRowResponse_Flush{
+						Checksum:    &crc,
+						ResumeToken: nil,
+					},
+				},
+			},
+		},
+		{
+			name: "empty_heartbeat_flush",
+			resp: &btpb.TypedReadRowsResponse{
+				Response: &btpb.PartialRowResponse{
+					Flush: &btpb.PartialRowResponse_Flush{},
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := make(chan *typedReadRowsReqRecord, 10)
+			server := initMockServer(t)
+			server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{response: tc.resp})
+
+			res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "missing-token-table"), nil)
+
+			assertTypedReadRowsFailure(t, res, "expected failure when flush has no resume token ("+tc.name+")")
+			assertResumeTokens(t, recorder, "")
+		})
+	}
+}
+
+// TestTypedReadRows_NonEmptyBatchWithoutChecksum_Fails verifies that a non-empty batch flushed without a checksum fails.
+func TestTypedReadRows_NonEmptyBatchWithoutChecksum_Fails(t *testing.T) {
+	row := makeDefaultTypedRow("row1", "v")
+	data := serializeTypedRows(row)
+
+	recorder := make(chan *typedReadRowsReqRecord, 10)
+	server := initMockServer(t)
+	server.TypedReadRowsFn = mockTypedReadRowsFn(recorder, &typedReadRowsAction{
+		response: &btpb.TypedReadRowsResponse{
+			Response: &btpb.PartialRowResponse{
+				PartialRows: &btpb.PartialRowResponse_TypedRowsBatch{
+					TypedRowsBatch: &btpb.TypedRowsBatch{BatchData: data},
+				},
+				Flush: &btpb.PartialRowResponse_Flush{
+					Checksum:    nil, // Omitted checksum on non-empty batch
+					ResumeToken: []byte("token-1"),
+				},
+			},
+		},
+	})
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "no-checksum-table"), nil)
+
+	assertTypedReadRowsFailure(t, res, "expected failure when non-empty batch lacks checksum")
+	assertResumeTokens(t, recorder, "")
+}
+
+// TestTypedReadRows_Checksum_Corrupt_Fails verifies that a corrupted checksum triggers retries
+// from the last good committed resume_token (rejecting the corrupt flush's token) and fails once
+// retries are exhausted while preserving the already-committed rows.
+func TestTypedReadRows_Checksum_Corrupt_Fails(t *testing.T) {
+	row1 := makeDefaultTypedRow("row1", "good-data")
+	row2 := makeDefaultTypedRow("corrupt-crc-row", "some-data")
+
+	var attempts atomic.Int32
+	server := initMockServer(t)
+	// A closure rather than mockTypedReadRowsFn: the client retries on checksum mismatch, and
+	// this must serve the corrupt second batch on every retry attempt so the failure is the
+	// client exhausting retries. A one-shot action queue would hand the retry an empty stream,
+	// which the client reports as a successful end-of-stream.
+	server.TypedReadRowsFn = func(req *btpb.TypedReadRowsRequest, srv btpb.Bigtable_TypedReadRowsServer) error {
+		n := attempts.Add(1)
+		if n == 1 {
+			assert.Empty(t, req.GetResumeToken(), "initial request must have an empty resume_token")
+			if err := srv.Send(makeFlushResponse("token-good-1", []*btpb.TypedRow{row1})); err != nil {
+				return err
+			}
+			return srv.Send(makeCorruptFlushResponse("token-corrupt-crc", []*btpb.TypedRow{row2}, row1))
+		}
+		assert.Equal(t, []byte("token-good-1"), req.GetResumeToken(),
+			"attempt %d must retry from the last good committed resume_token, not the corrupt flush's token", n)
+		return srv.Send(makeCorruptFlushResponse("token-corrupt-crc", []*btpb.TypedRow{row2}, row1))
+	}
+
+	res := doTypedReadRowsOp(t, server, makeProxyTypedReadRowsRequest(t, "test-table"), nil)
+
+	// Retry budget bound (1 initial attempt + 3 retries); see TestTypedReadRows_Resumption_RetryExhaustion.
+	assert.GreaterOrEqual(t, int(attempts.Load()), 4)
+	assert.NotNil(t, res)
+	assert.Equal(t, int32(codes.Unavailable), res.GetStatus().GetCode())
+	assertTypedRowsEqual(t, []*btpb.TypedRow{row1}, res.Rows)
 }
